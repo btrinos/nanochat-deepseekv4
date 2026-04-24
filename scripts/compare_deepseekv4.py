@@ -209,12 +209,19 @@ def get_batch(tokens, batch_size, seq_len, device, rng, positions=None):
     max_start = len(tokens) - seq_len - 1
     if max_start <= 0:
         raise ValueError(f"Dataset split is too short for seq_len={seq_len}: {len(tokens)} byte tokens")
-    if positions is None:
-        positions = torch.arange(seq_len + 1, device=device)
-    starts = torch.randint(0, max_start, (batch_size,), generator=rng, device="cpu").to(device)
+    source_device = tokens.device
+    if positions is None or positions.device != source_device:
+        positions = torch.arange(seq_len + 1, device=source_device)
+    starts = torch.randint(0, max_start, (batch_size,), generator=rng, device="cpu")
+    if source_device.type != "cpu":
+        starts = starts.to(source_device)
     offsets = starts[:, None] + positions[None, :]
     batch = tokens.index_select(0, offsets.reshape(-1)).view(batch_size, seq_len + 1)
-    return batch[:, :-1], batch[:, 1:]
+    x, y = batch[:, :-1], batch[:, 1:]
+    if x.device != device:
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
 
 
 def native_param_count(n_layer, n_embd, n_head):
@@ -446,13 +453,15 @@ def train_one(model_name, model, dataset_name, splits, run_cfg, args, seed, devi
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=run_cfg.lr, weight_decay=run_cfg.weight_decay)
-    train_tokens = encode_bytes(splits["train"]).to(device)
+    train_tokens_cpu = encode_bytes(splits["train"])
+    train_tokens = train_tokens_cpu.to(device)
     val_tokens = encode_bytes(splits["validation"]).to(device)
     test_tokens = encode_bytes(splits["test"]).to(device)
+    train_batch_tokens = train_tokens_cpu if device.type == "mps" else train_tokens
 
     rng = torch.Generator(device="cpu")
     rng.manual_seed(seed)
-    positions = torch.arange(run_cfg.seq_len + 1, device=device)
+    positions = torch.arange(run_cfg.seq_len + 1, device=train_batch_tokens.device)
     eval_batch_size = run_cfg.eval_batch_size or run_cfg.batch_size
     train_eval_starts = make_fixed_starts(
         train_tokens.numel(),
@@ -467,7 +476,7 @@ def train_one(model_name, model, dataset_name, splits, run_cfg, args, seed, devi
     expert_rows = []
     start_time = time.time()
     for step in range(1, run_cfg.steps + 1):
-        x, y = get_batch(train_tokens, run_cfg.batch_size, run_cfg.seq_len, device, rng, positions)
+        x, y = get_batch(train_batch_tokens, run_cfg.batch_size, run_cfg.seq_len, device, rng, positions)
         optimizer.zero_grad(set_to_none=True)
         if isinstance(model, DeepSeekV4NanoChat):
             loss = model(x, y, include_aux_loss=True)
