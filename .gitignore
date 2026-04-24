@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+dev-ignore/
+report.md
+eval_bundle/
+
+# Secrets
+.env
+
+# Local setup
+CLAUDE.md
+wandb/
+
+# Local benchmark caches
+artifacts/**/data_cache/
+artifacts/*smoke*/
+artifacts/deepseekv4_compare/
+artifacts/deepseekv4_paper_compare/
+artifacts/deepseekv4_full_compare/
