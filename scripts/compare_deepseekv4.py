@@ -16,6 +16,7 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -30,6 +31,61 @@ TINY_SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/mast
 HF_ROWS_URL = "https://datasets-server.huggingface.co/rows"
 WIKITEXT_PARQUET_URL = "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-2-raw-v1"
 VOCAB_SIZE = 257
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    name: str
+    seq_len: int
+    n_layer: int
+    n_embd: int
+    n_head: int
+    batch_size: int
+    steps: int
+    eval_every: int
+    eval_batch_size: int
+    train_eval_batches: int
+    lr: float = 3e-4
+    weight_decay: float = 0.01
+    grad_clip: float = 1.0
+    deepseek_n_routed_experts: int = 4
+    deepseek_num_experts_per_tok: int = 2
+    deepseek_moe_intermediate_size: int = 0
+    deepseek_index_topk: int = 4
+
+
+CONFIG_PRESETS = {
+    "small": BenchmarkConfig(
+        name="small",
+        seq_len=64,
+        n_layer=2,
+        n_embd=128,
+        n_head=4,
+        batch_size=8,
+        steps=100,
+        eval_every=10,
+        eval_batch_size=256,
+        train_eval_batches=32,
+        deepseek_n_routed_experts=4,
+        deepseek_moe_intermediate_size=128,
+        deepseek_index_topk=4,
+    ),
+    "medium": BenchmarkConfig(
+        name="medium",
+        seq_len=256,
+        n_layer=6,
+        n_embd=256,
+        n_head=8,
+        batch_size=8,
+        steps=1000,
+        eval_every=100,
+        eval_batch_size=128,
+        train_eval_batches=16,
+        deepseek_n_routed_experts=8,
+        deepseek_moe_intermediate_size=256,
+        deepseek_index_topk=8,
+    ),
+}
 
 
 def fetch_url(url, timeout=120, retries=5):
@@ -161,6 +217,12 @@ def get_batch(tokens, batch_size, seq_len, device, rng, positions=None):
     return batch[:, :-1], batch[:, 1:]
 
 
+def native_param_count(n_layer, n_embd, n_head):
+    assert n_embd % n_head == 0
+    padded_vocab = ((VOCAB_SIZE + 63) // 64) * 64
+    return 2 * padded_vocab * n_embd + n_layer * 12 * n_embd * n_embd
+
+
 def build_native(seq_len, n_layer, n_embd, n_head):
     config = GPTConfig(
         sequence_len=seq_len,
@@ -176,39 +238,69 @@ def build_native(seq_len, n_layer, n_embd, n_head):
     return model
 
 
-def build_deepseekv4(seq_len, n_layer, n_embd, n_head):
+def deepseek_config(run_cfg, no_hash_routing=False, no_shared_expert=False):
     config = DeepSeekV4NanoConfig(
-        sequence_len=seq_len,
+        sequence_len=run_cfg.seq_len,
         vocab_size=VOCAB_SIZE,
-        n_layer=n_layer,
-        n_head=n_head,
+        n_layer=run_cfg.n_layer,
+        n_head=run_cfg.n_head,
         n_kv_head=1,
-        n_embd=n_embd,
-        window_size=max(16, seq_len // 2),
+        n_embd=run_cfg.n_embd,
+        window_size=max(16, run_cfg.seq_len // 2),
         attention_layer_pattern="CSA,HCA",
         csa_compress_ratio=4,
         hca_compress_ratio=16,
-        rope_head_dim=max(8, (n_embd // n_head) // 2),
-        q_lora_rank=max(16, n_embd // 2),
-        o_lora_rank=max(16, n_embd // 2),
-        o_groups=min(n_head, 4),
-        n_routed_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=max(64, n_embd),
-        n_hash_layers=1 if n_layer > 1 else 0,
+        rope_head_dim=max(8, (run_cfg.n_embd // run_cfg.n_head) // 2),
+        q_lora_rank=max(16, run_cfg.n_embd // 2),
+        o_lora_rank=max(16, run_cfg.n_embd // 2),
+        o_groups=min(run_cfg.n_head, 4),
+        n_routed_experts=run_cfg.deepseek_n_routed_experts,
+        n_shared_experts=0 if no_shared_expert else 1,
+        num_experts_per_tok=run_cfg.deepseek_num_experts_per_tok,
+        moe_intermediate_size=run_cfg.deepseek_moe_intermediate_size or max(64, run_cfg.n_embd),
+        n_hash_layers=0 if no_hash_routing else -1,
+        n_hash_layers_frac=0.25,
         routed_scaling_factor=1.0,
         aux_free_balance_rate=1e-3,
         sequence_balance_loss_weight=1e-2,
         hc_mult=2,
-        hc_sinkhorn_iters=4,
+        hc_sinkhorn_iters=8,
         num_nextn_predict_layers=1,
         mtp_loss_weight=0.1,
-        original_max_position_embeddings=seq_len,
-        index_topk=4,
+        original_max_position_embeddings=run_cfg.seq_len,
+        index_topk=run_cfg.deepseek_index_topk,
     )
+    return config
+
+
+def build_deepseekv4(run_cfg, no_hash_routing=False, no_shared_expert=False):
+    config = deepseek_config(run_cfg, no_hash_routing=no_hash_routing, no_shared_expert=no_shared_expert)
     model = DeepSeekV4NanoChat(config, pad_vocab_size_to=64)
     model.init_weights()
     return model
+
+
+def choose_param_matched_native(run_cfg, target_active_params):
+    best = None
+    min_embd = max(run_cfg.n_head * 8, 64)
+    max_embd = max(run_cfg.n_embd * 3, run_cfg.n_embd + run_cfg.n_head)
+    for n_layer in range(1, max(run_cfg.n_layer + 7, 8)):
+        for n_embd in range(min_embd, max_embd + 1, run_cfg.n_head):
+            params = native_param_count(n_layer, n_embd, run_cfg.n_head)
+            rel_delta = abs(params - target_active_params) / max(1, target_active_params)
+            same_depth_penalty = 0 if n_layer == run_cfg.n_layer else 0.02
+            score = rel_delta + same_depth_penalty
+            candidate = (score, rel_delta, params, n_layer, n_embd)
+            if best is None or candidate < best:
+                best = candidate
+    _, rel_delta, params, n_layer, n_embd = best
+    if rel_delta > 0.05:
+        print(
+            f"Warning: closest parameter-matched GPT is {params:,} params, "
+            f"{100 * rel_delta:.1f}% from target {target_active_params:,}",
+            flush=True,
+        )
+    return n_layer, n_embd, params
 
 
 def primary_loss(model, x, y):
@@ -315,77 +407,136 @@ def display_dataset_name(dataset):
     return dataset.replace("_", " ").title()
 
 
-def train_one(model_name, model, splits, args, device):
+def record_metric(rows, seed, config_name, model_name, dataset_name, split, tokens_trained, loss):
+    rows.append({
+        "seed": seed,
+        "config": config_name,
+        "model": model_name,
+        "dataset": dataset_name,
+        "split": split,
+        "tokens_trained": tokens_trained,
+        "loss": loss,
+        "ppl": perplexity(loss),
+        "bits_per_byte": bits_per_byte(loss),
+    })
+
+
+def collect_expert_counts(model, seed, config_name, model_name, dataset_name, tokens_trained):
+    if not isinstance(model, DeepSeekV4NanoChat):
+        return []
+    rows = []
+    for layer_idx, block in enumerate(model.transformer.h):
+        counts = block.moe.last_expert_counts.detach().cpu().tolist()
+        for expert_idx, count in enumerate(counts):
+            rows.append({
+                "seed": seed,
+                "config": config_name,
+                "model": model_name,
+                "dataset": dataset_name,
+                "tokens_trained": tokens_trained,
+                "layer": layer_idx,
+                "expert": expert_idx,
+                "count": int(count),
+            })
+    return rows
+
+
+def train_one(model_name, model, dataset_name, splits, run_cfg, args, seed, device):
     model.to(device)
     model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=run_cfg.lr, weight_decay=run_cfg.weight_decay)
     train_tokens = encode_bytes(splits["train"]).to(device)
     val_tokens = encode_bytes(splits["validation"]).to(device)
     test_tokens = encode_bytes(splits["test"]).to(device)
 
     rng = torch.Generator(device="cpu")
-    rng.manual_seed(args.seed)
-    positions = torch.arange(args.seq_len + 1, device=device)
-    eval_batch_size = args.eval_batch_size or args.batch_size
+    rng.manual_seed(seed)
+    positions = torch.arange(run_cfg.seq_len + 1, device=device)
+    eval_batch_size = run_cfg.eval_batch_size or run_cfg.batch_size
     train_eval_starts = make_fixed_starts(
         train_tokens.numel(),
-        args.seq_len,
-        args.train_eval_batches * eval_batch_size,
-        args.seed + 3000,
+        run_cfg.seq_len,
+        run_cfg.train_eval_batches * eval_batch_size,
+        seed + 3000,
     )
     params = sum(p.numel() for p in model.parameters())
     active_params = estimate_active_params(model)
-    records = []
+    metric_rows = []
+    curve_rows = []
+    expert_rows = []
     start_time = time.time()
-    for step in range(1, args.steps + 1):
-        x, y = get_batch(train_tokens, args.batch_size, args.seq_len, device, rng, positions)
+    for step in range(1, run_cfg.steps + 1):
+        x, y = get_batch(train_tokens, run_cfg.batch_size, run_cfg.seq_len, device, rng, positions)
         optimizer.zero_grad(set_to_none=True)
         if isinstance(model, DeepSeekV4NanoChat):
             loss = model(x, y, include_aux_loss=True)
         else:
             loss = model(x, y)
         loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if run_cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), run_cfg.grad_clip)
         optimizer.step()
         if isinstance(model, DeepSeekV4NanoChat):
             model.update_aux_free_balance()
 
         should_eval = (
             (step == 1 and not args.skip_initial_eval)
-            or (args.eval_every > 0 and step % args.eval_every == 0)
-            or step == args.steps
+            or (run_cfg.eval_every > 0 and step % run_cfg.eval_every == 0)
+            or step == run_cfg.steps
         )
         if should_eval:
-            train_loss = evaluate_fixed_starts(
-                model, train_tokens, train_eval_starts, eval_batch_size, args.seq_len, device
-            )
+            tokens_trained = step * run_cfg.batch_size * run_cfg.seq_len
+            expert_rows.extend(collect_expert_counts(
+                model, seed, run_cfg.name, model_name, dataset_name, tokens_trained
+            ))
             if args.full_eval:
-                val_loss = evaluate_full_split(model, val_tokens, eval_batch_size, args.seq_len, device)
-                test_loss = evaluate_full_split(model, test_tokens, eval_batch_size, args.seq_len, device)
+                val_loss = evaluate_full_split(model, val_tokens, eval_batch_size, run_cfg.seq_len, device)
             else:
-                val_loss = evaluate(model, val_tokens, args.batch_size, args.seq_len, device, args.eval_batches, args.seed + 1000 + step)
-                test_loss = evaluate(model, test_tokens, args.batch_size, args.seq_len, device, args.eval_batches, args.seed + 2000 + step)
+                val_loss = evaluate(
+                    model, val_tokens, run_cfg.batch_size, run_cfg.seq_len, device, args.eval_batches, seed + 1000 + step
+                )
             elapsed = time.time() - start_time
-            records.append({
-                "model": model_name,
-                "step": step,
-                "tokens_seen": step * args.batch_size * args.seq_len,
-                "train_loss": train_loss,
-                "validation_loss": val_loss,
-                "test_loss": test_loss,
-                "train_objective": float(loss.detach().cpu()),
-                "seconds": elapsed,
-                "params": params,
-                "active_params": active_params,
-            })
+            record_metric(curve_rows, seed, run_cfg.name, model_name, dataset_name, "validation", tokens_trained, val_loss)
             print(
-                f"{model_name:22s} step {step:04d}/{args.steps:04d} "
-                f"train {train_loss:.4f} val {val_loss:.4f} test {test_loss:.4f} "
-                f"train_obj {float(loss.detach().cpu()):.4f}",
+                f"seed {seed:<5d} {dataset_name:18s} {model_name:24s} "
+                f"step {step:04d}/{run_cfg.steps:04d} val {val_loss:.4f} "
+                f"train_obj {float(loss.detach().cpu()):.4f} elapsed {elapsed:.1f}s",
                 flush=True,
             )
-    return records
+
+    tokens_trained = run_cfg.steps * run_cfg.batch_size * run_cfg.seq_len
+    train_split_name = "train" if args.full_eval else "train_eval"
+    final_splits = [
+        (train_split_name, train_tokens),
+        ("validation", val_tokens),
+        ("test", test_tokens),
+    ]
+    for split_name, split_tokens in final_splits:
+        if args.full_eval:
+            split_loss = evaluate_full_split(model, split_tokens, eval_batch_size, run_cfg.seq_len, device)
+        elif split_name == "train":
+            split_loss = evaluate_fixed_starts(model, train_tokens, train_eval_starts, eval_batch_size, run_cfg.seq_len, device)
+        else:
+            split_loss = evaluate(
+                model, split_tokens, run_cfg.batch_size, run_cfg.seq_len, device, args.eval_batches, seed + 4000
+            )
+        record_metric(metric_rows, seed, run_cfg.name, model_name, dataset_name, split_name, tokens_trained, split_loss)
+
+    metadata = {
+        "seed": seed,
+        "config": run_cfg.name,
+        "model": model_name,
+        "dataset": dataset_name,
+        "params": params,
+        "active_params": active_params,
+        "n_layer": getattr(model.config, "n_layer", run_cfg.n_layer),
+        "n_embd": getattr(model.config, "n_embd", run_cfg.n_embd),
+        "n_head": getattr(model.config, "n_head", run_cfg.n_head),
+        "seq_len": run_cfg.seq_len,
+        "steps": run_cfg.steps,
+        "batch_size": run_cfg.batch_size,
+    }
+    return metric_rows, curve_rows, expert_rows, metadata
 
 
 def format_token_tick(value, _pos=None):
@@ -567,86 +718,203 @@ def plot_final_bars(records, output_path):
     plt.close(fig)
 
 
-def write_csv(records, path):
+def write_rows(rows, path, fields):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "dataset",
-        "model",
-        "step",
-        "tokens_seen",
-        "train_loss",
-        "validation_loss",
-        "test_loss",
-        "train_objective",
-        "seconds",
-        "params",
-        "active_params",
-    ]
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(records)
-
-
-def write_summary_csv(records, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "dataset",
-        "model",
-        "split",
-        "step",
-        "tokens_seen",
-        "loss",
-        "perplexity",
-        "bits_per_byte",
-        "params",
-        "active_params",
-    ]
-    rows = []
-    for row in final_records(records):
-        for split, key in [
-            ("train_eval", "train_loss"),
-            ("validation", "validation_loss"),
-            ("test", "test_loss"),
-        ]:
-            loss = row[key]
-            rows.append({
-                "dataset": row["dataset"],
-                "model": row["model"],
-                "split": split,
-                "step": row["step"],
-                "tokens_seen": row["tokens_seen"],
-                "loss": loss,
-                "perplexity": perplexity(loss),
-                "bits_per_byte": bits_per_byte(loss),
-                "params": row["params"],
-                "active_params": row["active_params"],
-            })
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
 
 
+def write_metric_csv(rows, path):
+    fields = ["seed", "config", "model", "dataset", "split", "tokens_trained", "loss", "ppl", "bits_per_byte"]
+    write_rows(rows, path, fields)
+
+
+def mean_std(values):
+    n = len(values)
+    mean = sum(values) / n
+    if n == 1:
+        return mean, 0.0
+    var = sum((value - mean) ** 2 for value in values) / (n - 1)
+    return mean, math.sqrt(var)
+
+
+def write_summary_csv(rows, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "config",
+        "model",
+        "dataset",
+        "split",
+        "tokens_trained",
+        "n",
+        "loss_mean",
+        "loss_std",
+        "ppl_mean",
+        "ppl_std",
+        "bits_per_byte_mean",
+        "bits_per_byte_std",
+    ]
+    grouped = {}
+    for row in rows:
+        key = (row["config"], row["model"], row["dataset"], row["split"], row["tokens_trained"])
+        grouped.setdefault(key, []).append(row)
+    summary_rows = []
+    for key, group in sorted(grouped.items()):
+        config_name, model_name, dataset_name, split, tokens_trained = key
+        loss_mean, loss_std = mean_std([float(row["loss"]) for row in group])
+        ppl_mean, ppl_std = mean_std([float(row["ppl"]) for row in group])
+        bpb_mean, bpb_std = mean_std([float(row["bits_per_byte"]) for row in group])
+        summary_rows.append({
+            "config": config_name,
+            "model": model_name,
+            "dataset": dataset_name,
+            "split": split,
+            "tokens_trained": tokens_trained,
+            "n": len(group),
+            "loss_mean": loss_mean,
+            "loss_std": loss_std,
+            "ppl_mean": ppl_mean,
+            "ppl_std": ppl_std,
+            "bits_per_byte_mean": bpb_mean,
+            "bits_per_byte_std": bpb_std,
+        })
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+
+def write_metadata_csv(rows, path):
+    fields = [
+        "seed",
+        "config",
+        "model",
+        "dataset",
+        "params",
+        "active_params",
+        "n_layer",
+        "n_embd",
+        "n_head",
+        "seq_len",
+        "steps",
+        "batch_size",
+    ]
+    write_rows(rows, path, fields)
+
+
+def write_expert_counts_csv(rows, path):
+    fields = ["seed", "config", "model", "dataset", "tokens_trained", "layer", "expert", "count"]
+    write_rows(rows, path, fields)
+
+
+def parse_csv_arg(value):
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def resolve_config(args):
+    run_cfg = CONFIG_PRESETS[args.config]
+    overrides = {}
+    for arg_name, field_name in [
+        ("steps", "steps"),
+        ("eval_every", "eval_every"),
+        ("batch_size", "batch_size"),
+        ("eval_batch_size", "eval_batch_size"),
+        ("train_eval_batches", "train_eval_batches"),
+        ("seq_len", "seq_len"),
+        ("n_layer", "n_layer"),
+        ("n_embd", "n_embd"),
+        ("n_head", "n_head"),
+        ("lr", "lr"),
+        ("weight_decay", "weight_decay"),
+        ("grad_clip", "grad_clip"),
+    ]:
+        value = getattr(args, arg_name)
+        if value is not None:
+            overrides[field_name] = value
+    return replace(run_cfg, **overrides)
+
+
+def deepseek_active_params_for_matching(run_cfg):
+    model = build_deepseekv4(run_cfg)
+    active = estimate_active_params(model)
+    del model
+    return active
+
+
+def build_model_specs(selected_models, run_cfg, args):
+    specs = []
+    if "native" in selected_models:
+        specs.append({
+            "name": "native",
+            "builder": lambda: build_native(run_cfg.seq_len, run_cfg.n_layer, run_cfg.n_embd, run_cfg.n_head),
+        })
+    if "param_matched" in selected_models:
+        target_active = deepseek_active_params_for_matching(run_cfg)
+        matched_layers, matched_embd, matched_params = choose_param_matched_native(run_cfg, target_active)
+        print(
+            f"param_matched GPT target active {target_active:,}; using "
+            f"n_layer={matched_layers}, n_embd={matched_embd}, params={matched_params:,}",
+            flush=True,
+        )
+        specs.append({
+            "name": "param_matched",
+            "builder": lambda ml=matched_layers, me=matched_embd: build_native(
+                run_cfg.seq_len, ml, me, run_cfg.n_head
+            ),
+        })
+    if "deepseekv4" in selected_models:
+        variants = parse_csv_arg(args.ablations) if args.ablations else ["full"]
+        if args.no_hash_routing or args.no_shared_expert:
+            variants = ["custom"]
+        for variant in variants:
+            if variant not in {"full", "no_hash", "no_shared", "custom"}:
+                raise ValueError("DeepSeek ablations must be one of: full,no_hash,no_shared")
+            no_hash = args.no_hash_routing or variant == "no_hash"
+            no_shared = args.no_shared_expert or variant == "no_shared"
+            suffix = []
+            if no_hash:
+                suffix.append("no_hash")
+            if no_shared:
+                suffix.append("no_shared")
+            model_name = "deepseekv4" if not suffix else "deepseekv4_" + "_".join(suffix)
+            specs.append({
+                "name": model_name,
+                "builder": lambda nh=no_hash, ns=no_shared: build_deepseekv4(
+                    run_cfg, no_hash_routing=nh, no_shared_expert=ns
+                ),
+            })
+    if not specs:
+        raise ValueError("No models selected")
+    return specs
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", default="tiny_shakespeare,wikitext2", help="comma-separated: tiny_shakespeare,wikitext2")
-    parser.add_argument("--steps", type=int, default=40)
-    parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument("--config", default="small", choices=sorted(CONFIG_PRESETS), help="benchmark preset")
+    parser.add_argument("--models", default="native,param_matched,deepseekv4", help="comma-separated: native,param_matched,deepseekv4")
+    parser.add_argument("--seeds", type=int, default=1, help="number of seeds to run starting at --seed")
+    parser.add_argument("--ablations", default="full", help="DeepSeek variants: full,no_hash,no_shared")
+    parser.add_argument("--no-hash-routing", action="store_true", help="disable hash routing for the DeepSeek model")
+    parser.add_argument("--no-shared-expert", action="store_true", help="disable the DeepSeek shared expert")
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--eval-batches", type=int, default=8)
-    parser.add_argument("--eval-batch-size", type=int, default=256, help="batch size for --full-eval; 0 uses --batch-size")
-    parser.add_argument("--train-eval-batches", type=int, default=32, help="fixed train-eval batches for pure next-token cross-entropy")
+    parser.add_argument("--eval-batch-size", type=int, default=None, help="batch size for --full-eval; 0 uses --batch-size")
+    parser.add_argument("--train-eval-batches", type=int, default=None, help="fixed train-eval batches for pure next-token cross-entropy")
     parser.add_argument("--full-data", action="store_true", help="use full WikiText-2 train/validation/test splits instead of character caps")
     parser.add_argument("--full-eval", action="store_true", help="evaluate every non-overlapping window in validation/test splits")
     parser.add_argument("--skip-initial-eval", action="store_true", help="do not evaluate after step 1")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=64)
-    parser.add_argument("--n-layer", type=int, default=2)
-    parser.add_argument("--n-embd", type=int, default=128)
-    parser.add_argument("--n-head", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--n-layer", type=int, default=None)
+    parser.add_argument("--n-embd", type=int, default=None)
+    parser.add_argument("--n-head", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     parser.add_argument("--train-chars", type=int, default=600_000)
@@ -654,7 +922,9 @@ def main():
     parser.add_argument("--output-dir", default="artifacts/deepseekv4_compare")
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
+    if args.seeds < 1:
+        raise ValueError("--seeds must be >= 1")
+    run_cfg = resolve_config(args)
     device_type = autodetect_device_type() if args.device == "auto" else args.device
     device = torch.device(device_type)
     cache_dir = Path(args.output_dir) / "data_cache"
@@ -663,65 +933,76 @@ def main():
         "tiny_shakespeare": lambda: load_tiny_shakespeare(cache_dir),
         "wikitext2": lambda: load_wikitext2(cache_dir, args.train_chars, args.eval_chars, full_data=args.full_data),
     }
-    selected = [name.strip() for name in args.datasets.split(",") if name.strip()]
-    all_records = []
-    for dataset_name in selected:
+    selected_datasets = parse_csv_arg(args.datasets)
+    selected_models = parse_csv_arg(args.models)
+    unknown_models = sorted(set(selected_models) - {"native", "param_matched", "deepseekv4"})
+    if unknown_models:
+        raise ValueError(f"Unknown model(s): {unknown_models}")
+    model_specs = build_model_specs(selected_models, run_cfg, args)
+
+    all_metric_rows = []
+    all_curve_rows = []
+    all_expert_rows = []
+    all_metadata_rows = []
+    for dataset_name in selected_datasets:
         if dataset_name not in loaders:
             raise ValueError(f"Unknown dataset {dataset_name}. Choose from {sorted(loaders)}")
         print(f"\n=== Dataset: {dataset_name} ===")
         splits = loaders[dataset_name]()
 
-        for model_name, builder in [
-            ("native-nanochat", build_native),
-            ("nanochat-deepseekv4", build_deepseekv4),
-        ]:
-            torch.manual_seed(args.seed)
-            model = builder(args.seq_len, args.n_layer, args.n_embd, args.n_head)
-            params = sum(p.numel() for p in model.parameters())
-            print(f"{model_name}: {params:,} parameters")
-            records = train_one(model_name, model, splits, args, device)
-            for row in records:
-                row["dataset"] = dataset_name
-            all_records.extend(records)
-            del model
-            if device_type == "mps":
-                torch.mps.empty_cache()
-            elif device_type == "cuda":
-                torch.cuda.empty_cache()
+        for seed_idx in range(args.seeds):
+            seed = args.seed + seed_idx
+            for spec in model_specs:
+                torch.manual_seed(seed)
+                model = spec["builder"]()
+                params = sum(p.numel() for p in model.parameters())
+                active_params = estimate_active_params(model)
+                print(
+                    f"{spec['name']}: params={params:,} active={active_params:,} seed={seed}",
+                    flush=True,
+                )
+                metric_rows, curve_rows, expert_rows, metadata = train_one(
+                    spec["name"], model, dataset_name, splits, run_cfg, args, seed, device
+                )
+                all_metric_rows.extend(metric_rows)
+                all_curve_rows.extend(curve_rows)
+                all_expert_rows.extend(expert_rows)
+                all_metadata_rows.append(metadata)
+                del model
+                if device_type == "mps":
+                    torch.mps.empty_cache()
+                elif device_type == "cuda":
+                    torch.cuda.empty_cache()
 
     output_dir = Path(args.output_dir)
-    csv_path = output_dir / "losses.csv"
+    run_csv_path = output_dir / "runs.csv"
+    curve_csv_path = output_dir / "curves.csv"
     summary_csv_path = output_dir / "summary.csv"
-    validation_png_path = output_dir / f"validation_loss_{args.steps}_steps.png"
-    train_val_png_path = output_dir / f"train_validation_ce_{args.steps}_steps.png"
-    final_bar_png_path = output_dir / f"final_validation_test_bars_{args.steps}_steps.png"
-    write_csv(all_records, csv_path)
-    write_summary_csv(all_records, summary_csv_path)
-    plot_validation_curves(all_records, validation_png_path)
-    plot_results(
-        all_records,
-        train_val_png_path,
-        metric_titles=[("train_loss", "Train eval loss"), ("validation_loss", "Validation loss")],
-        y_label="cross-entropy loss",
-    )
-    plot_final_bars(all_records, final_bar_png_path)
+    curve_summary_csv_path = output_dir / "curve_summary.csv"
+    metadata_csv_path = output_dir / "model_metadata.csv"
+    expert_csv_path = output_dir / "expert_counts.csv"
+    write_metric_csv(all_metric_rows, run_csv_path)
+    write_metric_csv(all_curve_rows, curve_csv_path)
+    write_summary_csv(all_metric_rows, summary_csv_path)
+    write_summary_csv(all_curve_rows, curve_summary_csv_path)
+    write_metadata_csv(all_metadata_rows, metadata_csv_path)
+    write_expert_counts_csv(all_expert_rows, expert_csv_path)
 
     print("\nFinal losses")
-    for dataset_name in selected:
-        for model_name in ["native-nanochat", "nanochat-deepseekv4"]:
-            rows = [r for r in all_records if r["dataset"] == dataset_name and r["model"] == model_name]
-            row = rows[-1]
+    for row in sorted(all_metric_rows, key=lambda r: (r["config"], r["dataset"], r["model"], r["seed"], r["split"])):
+        if row["split"] in {"train", "validation", "test"}:
             print(
-                f"{dataset_name:18s} {model_name:22s} "
-                f"train {row['train_loss']:.4f} val {row['validation_loss']:.4f} "
-                f"test {row['test_loss']:.4f} params {row['params']:,} "
-                f"active {row['active_params']:,}"
+                f"{row['config']:7s} seed {row['seed']:<5d} {row['dataset']:18s} "
+                f"{row['model']:24s} {row['split']:10s} "
+                f"loss {row['loss']:.4f} ppl {row['ppl']:.2f} bpb {row['bits_per_byte']:.3f}"
             )
-    print(f"\nWrote {csv_path}")
+
+    print(f"\nWrote {run_csv_path}")
+    print(f"Wrote {curve_csv_path}")
     print(f"Wrote {summary_csv_path}")
-    print(f"Wrote {validation_png_path}")
-    print(f"Wrote {train_val_png_path}")
-    print(f"Wrote {final_bar_png_path}")
+    print(f"Wrote {curve_summary_csv_path}")
+    print(f"Wrote {metadata_csv_path}")
+    print(f"Wrote {expert_csv_path}")
 
 
 if __name__ == "__main__":

@@ -48,15 +48,18 @@ class DeepSeekV4NanoConfig:
     n_shared_experts: int = 1
     num_experts_per_tok: int = 2
     moe_intermediate_size: int = 0
-    n_hash_layers: int = 1
+    n_hash_layers: int = -1
+    n_hash_layers_frac: float = 0.25
+    hash_seed: int = 1729
     scoring_func: str = "sqrtsoftplus"
     routed_scaling_factor: float = 1.0
     norm_topk_prob: bool = True
     aux_free_balance_rate: float = 1e-3
     sequence_balance_loss_weight: float = 1e-2
+    logit_softcap: float = 15.0
     swiglu_limit: float = 10.0
     hc_mult: int = 2
-    hc_sinkhorn_iters: int = 4
+    hc_sinkhorn_iters: int = 8
     hc_eps: float = 1e-4
     num_nextn_predict_layers: int = 1
     mtp_loss_weight: float = 0.1
@@ -70,6 +73,13 @@ class DeepSeekV4NanoConfig:
     index_n_head: int = 0
     index_head_dim: int = 0
     attention_dropout: float = 0.0
+
+
+def _num_hash_layers(config: DeepSeekV4NanoConfig) -> int:
+    if config.n_hash_layers >= 0:
+        return min(config.n_hash_layers, config.n_layer)
+    frac_layers = math.ceil(config.n_layer * config.n_hash_layers_frac)
+    return max(0, min(config.n_layer, frac_layers))
 
 
 def _default_rank(config: DeepSeekV4NanoConfig, frac: float = 0.5) -> int:
@@ -371,7 +381,8 @@ class DeepSeekHybridAttention(nn.Module):
 
         scale = self.head_dim ** -0.5
         scores = torch.matmul(q, k_all.transpose(-2, -1)) * scale
-        scores[..., -1] = self.attn_sink.view(1, self.n_head, 1)
+        sink_index = k_all.size(-2) - 1
+        scores[..., sink_index] = self.attn_sink.view(1, self.n_head, 1)
         mask = torch.cat(masks, dim=-1)
         scores = scores.masked_fill(~mask.view(B, 1, T, -1), -float("inf"))
         att = F.softmax(scores.float(), dim=-1).to(q.dtype)
@@ -404,18 +415,24 @@ class DeepSeekMoE(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.hash_routing = layer_idx < config.n_hash_layers
+        self.hash_routing = layer_idx < _num_hash_layers(config)
         self.topk = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
+        assert self.topk <= self.n_routed_experts
         self.gate = Linear(config.n_embd, config.n_routed_experts, bias=False)
         self.register_buffer("gate_bias", torch.zeros(config.n_routed_experts), persistent=True)
         self.register_buffer("last_expert_counts", torch.zeros(config.n_routed_experts), persistent=False)
         self.last_sequence_balance_loss = None
         self.experts = nn.ModuleList([DeepSeekExpert(config) for _ in range(config.n_routed_experts)])
-        assert config.n_shared_experts == 1, "This scaled port supports one shared expert, matching DeepSeek V4."
-        self.shared_expert = DeepSeekExpert(config)
-        hashed = torch.arange(config.vocab_size).unsqueeze(1) + torch.arange(self.topk).unsqueeze(0)
-        hashed = (hashed + 17 * layer_idx) % config.n_routed_experts
+        assert config.n_shared_experts in {0, 1}, "This scaled port supports zero or one shared expert."
+        self.shared_expert = DeepSeekExpert(config) if config.n_shared_experts else None
+
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(config.hash_seed + layer_idx)
+        hashed = torch.stack([
+            torch.randperm(config.n_routed_experts, generator=generator)[:self.topk]
+            for _ in range(config.vocab_size)
+        ])
         self.register_buffer("tid2eid", hashed.long(), persistent=False)
 
     def _scores(self, x):
@@ -465,13 +482,30 @@ class DeepSeekMoE(nn.Module):
             counts = torch.bincount(indices.reshape(-1), minlength=self.n_routed_experts).to(self.last_expert_counts)
             self.last_expert_counts.copy_(counts)
 
-        y = self.shared_expert(flat).float()
+        if self.shared_expert is None:
+            y = flat.new_zeros(flat.shape, dtype=torch.float32)
+        else:
+            y = self.shared_expert(flat).float()
         routed = flat.new_zeros(flat.shape, dtype=torch.float32)
+        flat_experts = indices.reshape(-1)
+        flat_tokens = torch.arange(flat.size(0), device=flat.device).repeat_interleave(self.topk)
+        flat_weights = weights.reshape(-1)
+        order = torch.argsort(flat_experts)
+        flat_experts = flat_experts[order]
+        flat_tokens = flat_tokens[order]
+        flat_weights = flat_weights[order]
+        boundaries = torch.searchsorted(
+            flat_experts,
+            torch.arange(self.n_routed_experts + 1, device=flat.device),
+        )
         for expert_id, expert in enumerate(self.experts):
-            token_idx, which = torch.where(indices == expert_id)
-            if token_idx.numel() == 0:
+            start = boundaries[expert_id].item()
+            end = boundaries[expert_id + 1].item()
+            if start == end:
                 continue
-            routed[token_idx] += expert(flat[token_idx]).float() * weights[token_idx, which, None].float()
+            token_idx = flat_tokens[start:end]
+            expert_out = expert(flat[token_idx]).float()
+            routed.index_add_(0, token_idx, expert_out * flat_weights[start:end, None].float())
         return (y + routed).to(dtype=x.dtype).view(shape)
 
 
@@ -561,7 +595,7 @@ class DeepSeekV4NanoChat(nn.Module):
             MTPPredictionHead(config, padded_vocab_size)
             for _ in range(config.num_nextn_predict_layers)
         ])
-        self.rotary_seq_len = config.sequence_len * 10
+        self.rotary_seq_len = max(config.sequence_len * 2, 4096)
         cos, sin = precompute_yarn_rotary(self.rotary_seq_len, _rope_dim(config), config)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -573,8 +607,9 @@ class DeepSeekV4NanoChat(nn.Module):
 
         n_embd = self.config.n_embd
         bound = 3**0.5 * n_embd**-0.5
+        output_heads = {self.lm_head, *(head.head for head in self.mtp_heads)}
         for module in self.modules():
-            if isinstance(module, Linear):
+            if isinstance(module, Linear) and module not in output_heads:
                 torch.nn.init.uniform_(module.weight, -bound, bound)
             elif isinstance(module, GroupedOutputProjection):
                 module.init_weights(bound)
@@ -621,7 +656,7 @@ class DeepSeekV4NanoChat(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean", include_aux_loss=True):
         del kv_cache
         hidden = self._hidden(idx)
-        softcap = 15
+        softcap = self.config.logit_softcap
         logits = self.lm_head(hidden)[..., :self.config.vocab_size].float()
         logits = softcap * torch.tanh(logits / softcap)
 
@@ -664,7 +699,8 @@ class DeepSeekV4NanoChat(nn.Module):
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
         active_expert_frac = self.config.num_experts_per_tok / max(1, self.config.n_routed_experts)
-        return int(6 * nparams * (0.35 + active_expert_frac))
+        dense_fraction = 0.35  # non-expert blocks, embeddings, attention, MTP, and mixing paths.
+        return int(6 * nparams * (dense_fraction + active_expert_frac))
 
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
