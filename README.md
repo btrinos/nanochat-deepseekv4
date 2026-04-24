@@ -60,20 +60,15 @@ Not implemented:
 
 ## Benchmark Status
 
-The current committed measurements are seed-averaged small-config results:
-3 seeds, 100 optimizer steps, full-data final evaluation, and full validation
-curves. These are useful smoke-test results, not validation of DeepSeek-V4 at
-scale.
-
-The medium preset is implemented and is the right setting for a more meaningful
-architecture test, because `seq_len=256` gives the compressed attention and
-sliding-window branches room to operate. Medium results are not committed yet,
-so this README makes no medium-quality claim.
+The current committed measurements include seed-averaged small and medium
+results. The small config is a quick reproducibility smoke test. The medium
+config is the headline result because `seq_len=256` gives the compressed
+attention and sliding-window branches room to operate.
 
 Final train, validation, and test metrics are evaluated on every
 non-overlapping byte window in the corresponding split. Training samples random
-byte windows from the full train split; for the small run each model sees
-51,200 training byte tokens, not a full epoch.
+byte windows from the full train split; the small run sees 51,200 training byte
+tokens and the medium run sees 2,048,000 training byte tokens.
 
 The benchmark script is [scripts/compare_deepseekv4.py](scripts/compare_deepseekv4.py).
 Figures are rendered by [scripts/plot_deepseekv4_results.py](scripts/plot_deepseekv4_results.py).
@@ -83,7 +78,7 @@ Figures are rendered by [scripts/plot_deepseekv4_results.py](scripts/plot_deepse
 | config | sequence length | layers | width | heads | batch | steps | checkpoint interval | status |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
 | small | 64 | 2 | 128 | 4 | 8 | 100 | 10 steps | committed, 3 seeds |
-| medium | 256 | 6 | 256 | 8 | 8 | 1,000 | 100 steps | runnable, not yet reported |
+| medium | 256 | 6 | 256 | 8 | 8 | 1,000 | 100 steps | committed, 3 seeds on MPS |
 
 Model sizes for the benchmark presets:
 
@@ -104,12 +99,25 @@ Runtime guidance:
 
 | device | small full run | medium full run |
 |---|---|---|
-| Apple MPS | supported; practical for the committed small run | supported, but likely overnight or longer |
-| CUDA | expected to be the best target | recommended for the 3-seed, 1,000-step run |
+| Apple MPS | supported; practical for the committed small run | measured on M3 Ultra: about 53 minutes |
+| CUDA | expected to be a good target | not measured in this repository |
 | CPU | smoke tests only | not recommended |
 
-CUDA runtime has not been measured in this repository yet; treat the table as
-planning guidance, not a benchmark.
+The committed medium MPS run used float32 with `PYTORCH_ENABLE_MPS_FALLBACK=0`.
+BF16/FP16 autocast was tried in a smoke test and was slower for this model path
+on this machine, so it was not used.
+
+Apple Silicon optimizations kept for the medium run:
+
+- Cached repeated attention masks and compression metadata.
+- Used a padded batched MoE dispatch for training, while keeping contiguous
+  per-expert slices for eval where they are faster on MPS.
+- Evaluated full non-overlapping splits with contiguous views instead of MPS
+  random gathers.
+- Gathered random training byte windows on CPU for MPS runs, then moved only
+  the small batch to MPS.
+- Reused the native GPT run for medium `param_matched`, because the selected
+  architecture is exactly identical to native for this preset.
 
 ## Dataset Sizes
 
@@ -163,7 +171,56 @@ Validation/test deltas for the DeepSeek-V4 variant:
 
 Raw CSVs are in [artifacts/deepseekv4_small_multiseed](artifacts/deepseekv4_small_multiseed).
 
+## Medium-Config Results
+
+All numbers are mean +/- sample standard deviation across 3 seeds. The native
+GPT and parameter-matched GPT rows are identical because the medium
+parameter-matched search resolves to the same 6-layer, width-256 GPT
+architecture as the native medium baseline.
+
+| config | dataset | split | model | loss | perplexity | bits/byte |
+|---|---|---|---|---:|---:|---:|
+| medium | Tiny Shakespeare | validation | native GPT | 1.7250 +/- 0.0305 | 5.61 +/- 0.17 | 2.489 +/- 0.044 |
+| medium | Tiny Shakespeare | validation | param-matched GPT | 1.7250 +/- 0.0305 | 5.61 +/- 0.17 | 2.489 +/- 0.044 |
+| medium | Tiny Shakespeare | validation | DeepSeek-V4 variant | 1.6066 +/- 0.0218 | 4.99 +/- 0.11 | 2.318 +/- 0.031 |
+| medium | Tiny Shakespeare | test | native GPT | 1.8015 +/- 0.0224 | 6.06 +/- 0.14 | 2.599 +/- 0.032 |
+| medium | Tiny Shakespeare | test | param-matched GPT | 1.8015 +/- 0.0224 | 6.06 +/- 0.14 | 2.599 +/- 0.032 |
+| medium | Tiny Shakespeare | test | DeepSeek-V4 variant | 1.6966 +/- 0.0167 | 5.46 +/- 0.09 | 2.448 +/- 0.024 |
+| medium | WikiText-2 | validation | native GPT | 1.7178 +/- 0.0056 | 5.57 +/- 0.03 | 2.478 +/- 0.008 |
+| medium | WikiText-2 | validation | param-matched GPT | 1.7178 +/- 0.0056 | 5.57 +/- 0.03 | 2.478 +/- 0.008 |
+| medium | WikiText-2 | validation | DeepSeek-V4 variant | 1.6380 +/- 0.0140 | 5.15 +/- 0.07 | 2.363 +/- 0.020 |
+| medium | WikiText-2 | test | native GPT | 1.7361 +/- 0.0045 | 5.67 +/- 0.03 | 2.505 +/- 0.006 |
+| medium | WikiText-2 | test | param-matched GPT | 1.7361 +/- 0.0045 | 5.67 +/- 0.03 | 2.505 +/- 0.006 |
+| medium | WikiText-2 | test | DeepSeek-V4 variant | 1.6571 +/- 0.0098 | 5.24 +/- 0.05 | 2.391 +/- 0.014 |
+
+Medium validation/test deltas for the DeepSeek-V4 variant:
+
+| dataset | split | loss delta vs native | loss delta vs param-matched | PPL change vs native | PPL change vs param-matched |
+|---|---|---:|---:|---:|---:|
+| Tiny Shakespeare | validation | -0.1184 | -0.1184 | -11.2% | -11.2% |
+| Tiny Shakespeare | test | -0.1049 | -0.1049 | -10.0% | -10.0% |
+| WikiText-2 | validation | -0.0797 | -0.0797 | -7.7% | -7.7% |
+| WikiText-2 | test | -0.0789 | -0.0789 | -7.6% | -7.6% |
+
+Raw CSVs are in [artifacts/deepseekv4_medium_mps_multiseed](artifacts/deepseekv4_medium_mps_multiseed).
+
 ## Figures
+
+Medium final perplexity:
+
+![Medium final perplexity grouped bars](artifacts/deepseekv4_medium_mps_multiseed/perplexity_grouped_bars.png)
+
+Medium validation loss curves:
+
+![Medium validation loss curves](artifacts/deepseekv4_medium_mps_multiseed/validation_loss_curves.png)
+
+Medium bits/byte:
+
+![Medium bits per byte grouped bars](artifacts/deepseekv4_medium_mps_multiseed/bits_per_byte_grouped_bars.png)
+
+Medium expert utilization at the final DeepSeek-V4 checkpoint:
+
+![Medium expert utilization heatmap](artifacts/deepseekv4_medium_mps_multiseed/expert_utilization_heatmap.png)
 
 Final perplexity:
 
@@ -187,18 +244,28 @@ Ablations on WikiText-2 validation:
 
 ## Interpretation
 
-In the committed small run, the DeepSeek-V4 variant finishes below both GPT
-baselines on train, validation, and test for Tiny Shakespeare and WikiText-2.
-That means the result is not just a validation-only artifact. It also means the
-gain is not explained by active parameter count alone in this particular small
-setting, because the parameter-matched GPT baseline is worse than both the
-native GPT and the DeepSeek-style model.
+In the committed medium run, the DeepSeek-V4 variant finishes below the GPT
+baseline on validation and test for both datasets. The gains are smaller than
+the small-config run but still consistent across seeds: about 10-11% lower
+perplexity on Tiny Shakespeare and about 7-8% lower perplexity on WikiText-2.
 
-The validation curves show the native GPT improving faster early in training,
-while the DeepSeek-V4 variant catches up and crosses it later. That pattern is
-plausible for a model with routing, compressed attention, Hyper-Connections,
-and MTP: there are more mechanisms to coordinate, so the first few checkpoints
-are not the whole story.
+The medium validation curves show all models learning quickly at first, with
+the DeepSeek-V4 variant moving ahead after the first checkpoint. This is a
+stronger signal than the original smoke test because `seq_len=256`, six layers,
+and eight routed experts exercise the compressed attention, sliding-window, and
+MoE paths more meaningfully.
+
+The result still should not be framed as "DeepSeek-V4 validated." It is a
+small byte-level experiment with an independent implementation and a short
+2.048M-token training budget. What it does show is that, at this scale, the
+ported architecture is not merely adding parameters: the medium
+parameter-matched GPT is identical to the native GPT, and the DeepSeek-style
+variant still improves held-out loss.
+
+In the small run, the DeepSeek-V4 variant also finishes below both GPT
+baselines on train, validation, and test for Tiny Shakespeare and WikiText-2.
+The small run is useful for reproducibility and ablations, but it only lightly
+exercises the long-context machinery.
 
 The ablation panel is mixed, which is exactly the kind of signal this benchmark
 is meant to expose. Removing hash routing is statistically tied with the full
@@ -207,16 +274,11 @@ not support a small-scale hash-routing benefit. Removing the shared expert is
 worse (`+0.0218` validation loss), which suggests the shared expert is earning
 its parameters at this scale.
 
-The expert-utilization heatmap shows no collapsed routed expert at the final
-checkpoint. With top-2 routing across four experts, a perfectly even layer would
-put about one quarter of assignments on each expert; the observed final
-utilization stays near that range. That is evidence that the balancing machinery
-is active, not evidence that the MoE design is optimal.
-
-The main caveat is scale. At `seq_len=64`, compressed attention and
-sliding-window behavior are still only lightly exercised. The medium preset is
-the minimum configuration here that should be treated as a real architecture
-test.
+The medium expert-utilization heatmap shows the hash-routed first layers are
+less uniform than the later learned-routing layers. Layers 2-5 stay close to
+the expected 12.5% per expert for top-2 routing across eight experts, which is
+evidence that the balancing machinery is active. It is not evidence that the
+MoE design is optimal.
 
 More detail is in [RESULTS.md](RESULTS.md).
 
@@ -260,10 +322,10 @@ python -m scripts.plot_deepseekv4_results \
   --ablation-split validation
 ```
 
-Run the medium benchmark on CUDA:
+Run the committed medium benchmark on Apple MPS:
 
 ```bash
-python -m scripts.compare_deepseekv4 \
+PYTORCH_ENABLE_MPS_FALLBACK=0 NANOCHAT_DTYPE=float32 python -m scripts.compare_deepseekv4 \
   --datasets tiny_shakespeare,wikitext2 \
   --config medium \
   --models native,param_matched,deepseekv4 \
@@ -271,8 +333,18 @@ python -m scripts.compare_deepseekv4 \
   --full-data \
   --full-eval \
   --skip-initial-eval \
-  --device cuda \
-  --output-dir artifacts/deepseekv4_medium_multiseed
+  --device mps \
+  --output-dir artifacts/deepseekv4_medium_mps_multiseed
+```
+
+Regenerate medium figures:
+
+```bash
+python -m scripts.plot_deepseekv4_results \
+  --input-dir artifacts/deepseekv4_medium_mps_multiseed \
+  --config medium \
+  --dataset wikitext2 \
+  --ablation-split validation
 ```
 
 Downloaded dataset caches are written under `data_cache/` inside the output
