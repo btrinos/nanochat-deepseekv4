@@ -284,8 +284,10 @@ def choose_param_matched_native(run_cfg, target_active_params):
     best = None
     min_embd = max(run_cfg.n_head * 8, 64)
     max_embd = max(run_cfg.n_embd * 3, run_cfg.n_embd + run_cfg.n_head)
+    embd_step = 2 * run_cfg.n_head
+    min_embd = ((min_embd + embd_step - 1) // embd_step) * embd_step
     for n_layer in range(1, max(run_cfg.n_layer + 7, 8)):
-        for n_embd in range(min_embd, max_embd + 1, run_cfg.n_head):
+        for n_embd in range(min_embd, max_embd + 1, embd_step):
             params = native_param_count(n_layer, n_embd, run_cfg.n_head)
             rel_delta = abs(params - target_active_params) / max(1, target_active_params)
             same_depth_penalty = 0 if n_layer == run_cfg.n_layer else 0.02
@@ -721,7 +723,7 @@ def plot_final_bars(records, output_path):
 def write_rows(rows, path, fields):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -781,7 +783,7 @@ def write_summary_csv(rows, path):
             "bits_per_byte_std": bpb_std,
         })
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(summary_rows)
 
