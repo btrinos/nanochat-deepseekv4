@@ -62,8 +62,10 @@ Not implemented:
 
 The current committed measurements include seed-averaged small and medium
 results. The small config is a quick reproducibility smoke test. The medium
-config is the headline result because `seq_len=256` gives the compressed
-attention and sliding-window branches room to operate.
+config is the headline result because `seq_len=256`, six layers, and eight
+routed experts exercise the compressed-attention and MoE paths more meaningfully.
+The sliding-window branch is active, but its window still spans the full medium
+sequence.
 
 Final train, validation, and test metrics are evaluated on every
 non-overlapping byte window in the corresponding split. Training samples random
@@ -225,15 +227,24 @@ Medium expert utilization at the final DeepSeek-V4 checkpoint:
 ## Interpretation
 
 In the committed medium run, the DeepSeek-V4 variant finishes below the GPT
-baseline on validation and test for both datasets. The gains are smaller than
-the small-config run but still consistent across seeds: about 10-11% lower
-perplexity on Tiny Shakespeare and about 7-8% lower perplexity on WikiText-2.
+baseline on validation and test for both datasets. The gains are smaller in
+percentage terms than the small-config run but arguably more informative: the
+small DeepSeek-V4 variant has a 6.9% active-parameter advantage over the native
+GPT, while the medium comparison is active-parameter matched at 4.88M active
+parameters per token. The medium baseline losses are also much lower, leaving
+less proportional headroom. Even so, the DeepSeek-V4 variant is about 10-11%
+lower perplexity on Tiny Shakespeare and about 7-8% lower perplexity on
+WikiText-2. On the byte-level metric, WikiText-2 test improves from 2.50
+bits/byte for GPT to 2.39 bits/byte for the DeepSeek-V4 variant, a 4.6%
+reduction.
 
 The medium validation curves show all models learning quickly at first, with
 the DeepSeek-V4 variant moving ahead after the first checkpoint. This is a
 stronger signal than the original smoke test because `seq_len=256`, six layers,
-and eight routed experts exercise the compressed attention, sliding-window, and
-MoE paths more meaningfully.
+and eight routed experts exercise the compressed attention and MoE paths more
+meaningfully. The sliding-window branch is active, but at this sequence length
+the window still covers the full sequence, so any genuinely local-attention
+benefit would require longer-context runs to show.
 
 The result still should not be framed as "DeepSeek-V4 validated." It is a
 small byte-level experiment with an independent implementation and a short
@@ -248,11 +259,12 @@ The small run is useful for reproducibility and ablations, but it only lightly
 exercises the long-context machinery.
 
 The ablation panel is mixed, which is exactly the kind of signal this benchmark
-is meant to expose. Removing hash routing is statistically tied with the full
-small model on WikiText-2 validation (`-0.0013` loss delta), so this run does
-not support a small-scale hash-routing benefit. Removing the shared expert is
-worse (`+0.0218` validation loss), which suggests the shared expert is earning
-its parameters at this scale.
+is meant to expose. Removing hash routing gives a `-0.0013` loss delta on
+WikiText-2 validation, which is well within the seed-to-seed variation for this
+configuration (`sigma = 0.0127` for the full model and `0.0069` for the no-hash
+run). We cannot distinguish a hash-routing effect from noise at this scale.
+Removing the shared expert is worse (`+0.0218` validation loss), which suggests
+the shared expert is earning its parameters at this scale.
 
 The medium expert-utilization heatmap shows the hash-routed first layers are
 less uniform than the later learned-routing layers. Layers 2-5 stay close to
