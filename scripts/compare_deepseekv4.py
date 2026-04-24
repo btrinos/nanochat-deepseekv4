@@ -331,16 +331,15 @@ def evaluate(model, tokens, batch_size, seq_len, device, eval_batches, seed):
 def evaluate_full_split(model, tokens, batch_size, seq_len, device):
     model.eval()
     max_start = len(tokens) - seq_len - 1
-    starts = torch.arange(0, max_start, seq_len, device=device)
-    positions = torch.arange(seq_len + 1, device=device)
+    num_windows = (max_start + seq_len - 1) // seq_len
     total_loss = torch.zeros((), device=device)
     total_tokens = 0
-    for i in range(0, starts.numel(), batch_size):
-        batch_starts = starts[i:i + batch_size]
-        offsets = batch_starts[:, None] + positions[None, :]
-        batch = tokens.index_select(0, offsets.reshape(-1)).view(batch_starts.numel(), seq_len + 1)
-        x = batch[:, :-1]
-        y = batch[:, 1:]
+    for i in range(0, num_windows, batch_size):
+        windows = min(batch_size, num_windows - i)
+        start = i * seq_len
+        chunk = tokens[start:start + windows * seq_len + 1]
+        x = chunk[:-1].view(windows, seq_len)
+        y = chunk[1:].view(windows, seq_len)
         if isinstance(model, DeepSeekV4NanoChat):
             logits = model(x)
         else:
