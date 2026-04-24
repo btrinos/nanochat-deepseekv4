@@ -222,26 +222,6 @@ Medium expert utilization at the final DeepSeek-V4 checkpoint:
 
 ![Medium expert utilization heatmap](artifacts/deepseekv4_medium_mps_multiseed/expert_utilization_heatmap.png)
 
-Final perplexity:
-
-![Final perplexity grouped bars](artifacts/deepseekv4_small_multiseed/perplexity_grouped_bars.png)
-
-Validation loss curves:
-
-![Validation loss curves](artifacts/deepseekv4_small_multiseed/validation_loss_curves.png)
-
-Bits/byte:
-
-![Bits per byte grouped bars](artifacts/deepseekv4_small_multiseed/bits_per_byte_grouped_bars.png)
-
-Expert utilization at the final DeepSeek-V4 checkpoint:
-
-![Expert utilization heatmap](artifacts/deepseekv4_small_multiseed/expert_utilization_heatmap.png)
-
-Ablations on WikiText-2 validation:
-
-![Ablation panel](artifacts/deepseekv4_small_multiseed/ablation_panel.png)
-
 ## Interpretation
 
 In the committed medium run, the DeepSeek-V4 variant finishes below the GPT
