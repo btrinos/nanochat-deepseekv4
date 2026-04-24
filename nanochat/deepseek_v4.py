@@ -166,6 +166,10 @@ def sinkhorn(logits, iters=4, eps=1e-4):
     return matrix.exp().to(dtype=logits.dtype) + eps
 
 
+def _cache_key(device, *parts):
+    return (str(device),) + tuple(parts)
+
+
 class GatedCompressor(nn.Module):
     """Learned gated pooling over fixed token blocks for compressed attention memory."""
 
@@ -179,12 +183,29 @@ class GatedCompressor(nn.Module):
         self.v_proj = Linear(config.n_embd, kv_dim, bias=False)
         self.gate_proj = Linear(config.n_embd, kv_dim, bias=False)
         self.ape = nn.Parameter(torch.zeros(ratio, self.n_kv_head, self.head_dim))
+        self._group_cache = {}
 
-    def forward(self, x):
-        B, T, _ = x.shape
+    def _group_info(self, T, device):
+        key = _cache_key(device, T, self.ratio)
+        cached = self._group_cache.get(key)
+        if cached is not None:
+            return cached
         groups = math.ceil(T / self.ratio)
         padded = groups * self.ratio
         pad = padded - T
+        group_ends = torch.arange(self.ratio - 1, padded, self.ratio, device=device).clamp(max=T - 1)
+        valid = None
+        if pad:
+            valid = torch.ones(padded, device=device, dtype=torch.bool)
+            valid[T:] = False
+            valid = valid.view(1, groups, self.ratio, 1, 1)
+        cached = (groups, pad, group_ends, valid)
+        self._group_cache[key] = cached
+        return cached
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        groups, pad, group_ends, valid = self._group_info(T, x.device)
 
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -200,15 +221,11 @@ class GatedCompressor(nn.Module):
         gate = gate + self.ape.view(1, 1, self.ratio, self.n_kv_head, self.head_dim).to(gate.dtype)
 
         if pad:
-            valid = torch.ones(groups * self.ratio, device=x.device, dtype=torch.bool)
-            valid[T:] = False
-            valid = valid.view(1, groups, self.ratio, 1, 1)
             gate = gate.masked_fill(~valid, -float("inf"))
 
         weights = F.softmax(gate.float(), dim=2).to(k.dtype)
         ck = (k * weights).sum(dim=2)
         cv = (v * weights).sum(dim=2)
-        group_ends = torch.arange(self.ratio - 1, groups * self.ratio, self.ratio, device=x.device).clamp(max=T - 1)
         return ck, cv, group_ends
 
 
@@ -225,12 +242,39 @@ class LightningIndexer(nn.Module):
         self.k_proj = Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
         self.gate_proj = Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
         self.ape = nn.Parameter(torch.zeros(ratio, self.n_head, self.head_dim))
+        self._group_cache = {}
+        self._causal_cache = {}
 
-    def _compress_keys(self, x):
-        B, T, _ = x.shape
+    def _group_info(self, T, device):
+        key = _cache_key(device, T, self.ratio)
+        cached = self._group_cache.get(key)
+        if cached is not None:
+            return cached
         groups = math.ceil(T / self.ratio)
         padded = groups * self.ratio
         pad = padded - T
+        group_ends = torch.arange(self.ratio - 1, padded, self.ratio, device=device).clamp(max=T - 1)
+        valid = None
+        if pad:
+            valid = torch.ones(padded, device=device, dtype=torch.bool)
+            valid[T:] = False
+            valid = valid.view(1, groups, self.ratio, 1, 1)
+        cached = (groups, pad, group_ends, valid)
+        self._group_cache[key] = cached
+        return cached
+
+    def _causal_mask(self, T, group_ends, device):
+        key = _cache_key(device, T, group_ends.numel(), self.ratio)
+        cached = self._causal_cache.get(key)
+        if cached is not None:
+            return cached
+        cached = group_ends.view(1, 1, -1) <= torch.arange(T, device=device).view(1, T, 1)
+        self._causal_cache[key] = cached
+        return cached
+
+    def _compress_keys(self, x):
+        B, T, _ = x.shape
+        groups, pad, group_ends, valid = self._group_info(T, x.device)
         k = self.k_proj(x).view(B, T, self.n_head, self.head_dim)
         gate = self.gate_proj(x).view(B, T, self.n_head, self.head_dim)
         if pad:
@@ -240,13 +284,9 @@ class LightningIndexer(nn.Module):
         gate = gate.view(B, groups, self.ratio, self.n_head, self.head_dim)
         gate = gate + self.ape.view(1, 1, self.ratio, self.n_head, self.head_dim).to(gate.dtype)
         if pad:
-            valid = torch.ones(groups * self.ratio, device=x.device, dtype=torch.bool)
-            valid[T:] = False
-            valid = valid.view(1, groups, self.ratio, 1, 1)
             gate = gate.masked_fill(~valid, -float("inf"))
         weights = F.softmax(gate.float(), dim=2).to(k.dtype)
         keys = norm((k * weights).sum(dim=2))
-        group_ends = torch.arange(self.ratio - 1, groups * self.ratio, self.ratio, device=x.device).clamp(max=T - 1)
         return keys, group_ends
 
     def forward(self, x):
@@ -255,7 +295,7 @@ class LightningIndexer(nn.Module):
         queries = norm(self.q_proj(x).view(B, T, self.n_head, self.head_dim))
         index_scores = torch.einsum("bthd,bghd->bhtg", queries, keys) * (self.head_dim ** -0.5)
         index_scores = index_scores.mean(dim=1)
-        causal = group_ends.view(1, 1, -1) <= torch.arange(T, device=x.device).view(1, T, 1)
+        causal = self._causal_mask(T, group_ends, x.device)
         index_scores = index_scores.masked_fill(~causal, -float("inf"))
         topk = min(self.topk, keys.size(1))
         if topk <= 0:
@@ -325,6 +365,7 @@ class DeepSeekHybridAttention(nn.Module):
         self.compressor = GatedCompressor(config, self.compress_ratio) if self.compress_ratio else None
         self.indexer = LightningIndexer(config, self.compress_ratio) if self.kind == "CSA" and self.compress_ratio else None
         self.dropout_p = config.attention_dropout
+        self._mask_cache = {}
 
     def _repeat_kv(self, x):
         if self.n_kv_head == self.n_head:
@@ -333,12 +374,27 @@ class DeepSeekHybridAttention(nn.Module):
         return x.repeat_interleave(repeat, dim=2)
 
     def _local_mask(self, T, device):
+        key = _cache_key(device, T, self.config.window_size)
+        cached = self._mask_cache.get(key)
+        if cached is not None:
+            return cached
         pos = torch.arange(T, device=device)
         qpos = pos.view(T, 1)
         kpos = pos.view(1, T)
         causal = kpos <= qpos
         local = kpos >= (qpos - self.config.window_size + 1)
-        return causal & local
+        cached = causal & local
+        self._mask_cache[key] = cached
+        return cached
+
+    def _compressed_causal_mask(self, T, group_ends, device):
+        key = _cache_key(device, T, group_ends.numel(), self.compress_ratio)
+        cached = self._mask_cache.get(key)
+        if cached is not None:
+            return cached
+        cached = group_ends.view(1, 1, -1) <= torch.arange(T, device=device).view(1, T, 1)
+        self._mask_cache[key] = cached
+        return cached
 
     def forward(self, x, cos_sin):
         B, T, _ = x.shape
@@ -365,8 +421,7 @@ class DeepSeekHybridAttention(nn.Module):
             if self.indexer is not None:
                 compressed_mask, _ = self.indexer(x)
             else:
-                compressed_mask = group_ends.view(1, 1, -1) <= torch.arange(T, device=x.device).view(1, T, 1)
-                compressed_mask = compressed_mask.expand(B, -1, -1)
+                compressed_mask = self._compressed_causal_mask(T, group_ends, x.device).expand(B, -1, -1)
             masks.append(compressed_mask)
 
         zero_k = q.new_zeros(B, 1, self.n_head, self.head_dim)
@@ -435,6 +490,50 @@ class DeepSeekMoE(nn.Module):
         ])
         self.register_buffer("tid2eid", hashed.long(), persistent=False)
 
+    def _expert_weights(self, attr, dtype):
+        return torch.stack([getattr(expert, attr).weight for expert in self.experts], dim=0).to(dtype=dtype)
+
+    def _loop_dispatch(self, flat, flat_experts, flat_tokens, flat_weights):
+        routed = flat.new_zeros(flat.shape, dtype=torch.float32)
+        boundaries = torch.searchsorted(
+            flat_experts,
+            torch.arange(self.n_routed_experts + 1, device=flat.device),
+        )
+        for expert_id, expert in enumerate(self.experts):
+            start = boundaries[expert_id].item()
+            end = boundaries[expert_id + 1].item()
+            if start == end:
+                continue
+            token_idx = flat_tokens[start:end]
+            expert_out = expert(flat[token_idx]).float()
+            routed.index_add_(0, token_idx, expert_out * flat_weights[start:end, None].float())
+        return routed
+
+    def _batched_dispatch(self, flat, flat_experts, flat_tokens, flat_weights):
+        routed = flat.new_zeros(flat.shape, dtype=torch.float32)
+        counts = torch.bincount(flat_experts, minlength=self.n_routed_experts)
+        max_count = int(counts.max().detach().cpu())
+        if max_count == 0:
+            return routed
+
+        starts = torch.cumsum(counts, dim=0) - counts
+        ranks = torch.arange(flat_experts.numel(), device=flat.device) - starts.index_select(0, flat_experts)
+        dispatched = flat.new_zeros(self.n_routed_experts, max_count, flat.size(-1))
+        dispatched[flat_experts, ranks] = flat.index_select(0, flat_tokens)
+
+        w1 = self._expert_weights("w1", dispatched.dtype)
+        w3 = self._expert_weights("w3", dispatched.dtype)
+        w2 = self._expert_weights("w2", dispatched.dtype)
+        gate = torch.bmm(dispatched, w1.transpose(1, 2)).float()
+        up = torch.bmm(dispatched, w3.transpose(1, 2)).float()
+        if self.config.swiglu_limit > 0:
+            gate = torch.clamp(gate, max=self.config.swiglu_limit)
+            up = torch.clamp(up, min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
+        expert_out = torch.bmm((F.silu(gate) * up).to(dtype=dispatched.dtype), w2.transpose(1, 2)).float()
+        selected = expert_out[flat_experts, ranks] * flat_weights[:, None].float()
+        routed.index_add_(0, flat_tokens, selected)
+        return routed
+
     def _scores(self, x):
         scores = self.gate(x.float())
         if self.config.scoring_func == "softmax":
@@ -494,18 +593,10 @@ class DeepSeekMoE(nn.Module):
         flat_experts = flat_experts[order]
         flat_tokens = flat_tokens[order]
         flat_weights = flat_weights[order]
-        boundaries = torch.searchsorted(
-            flat_experts,
-            torch.arange(self.n_routed_experts + 1, device=flat.device),
-        )
-        for expert_id, expert in enumerate(self.experts):
-            start = boundaries[expert_id].item()
-            end = boundaries[expert_id + 1].item()
-            if start == end:
-                continue
-            token_idx = flat_tokens[start:end]
-            expert_out = expert(flat[token_idx]).float()
-            routed.index_add_(0, token_idx, expert_out * flat_weights[start:end, None].float())
+        if self.training:
+            routed = self._batched_dispatch(flat, flat_experts, flat_tokens, flat_weights)
+        else:
+            routed = self._loop_dispatch(flat, flat_experts, flat_tokens, flat_weights)
         return (y + routed).to(dtype=x.dtype).view(shape)
 
 

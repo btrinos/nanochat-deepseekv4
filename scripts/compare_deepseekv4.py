@@ -850,6 +850,7 @@ def build_model_specs(selected_models, run_cfg, args):
     if "native" in selected_models:
         specs.append({
             "name": "native",
+            "fingerprint": ("gpt", run_cfg.seq_len, run_cfg.n_layer, run_cfg.n_embd, run_cfg.n_head),
             "builder": lambda: build_native(run_cfg.seq_len, run_cfg.n_layer, run_cfg.n_embd, run_cfg.n_head),
         })
     if "param_matched" in selected_models:
@@ -862,6 +863,7 @@ def build_model_specs(selected_models, run_cfg, args):
         )
         specs.append({
             "name": "param_matched",
+            "fingerprint": ("gpt", run_cfg.seq_len, matched_layers, matched_embd, run_cfg.n_head),
             "builder": lambda ml=matched_layers, me=matched_embd: build_native(
                 run_cfg.seq_len, ml, me, run_cfg.n_head
             ),
@@ -883,6 +885,15 @@ def build_model_specs(selected_models, run_cfg, args):
             model_name = "deepseekv4" if not suffix else "deepseekv4_" + "_".join(suffix)
             specs.append({
                 "name": model_name,
+                "fingerprint": (
+                    "deepseekv4",
+                    run_cfg.seq_len,
+                    run_cfg.n_layer,
+                    run_cfg.n_embd,
+                    run_cfg.n_head,
+                    no_hash,
+                    no_shared,
+                ),
                 "builder": lambda nh=no_hash, ns=no_shared: build_deepseekv4(
                     run_cfg, no_hash_routing=nh, no_shared_expert=ns
                 ),
@@ -890,6 +901,14 @@ def build_model_specs(selected_models, run_cfg, args):
     if not specs:
         raise ValueError("No models selected")
     return specs
+
+
+def clone_rows_for_model(rows, model_name):
+    return [{**row, "model": model_name} for row in rows]
+
+
+def clone_metadata_for_model(metadata, model_name):
+    return {**metadata, "model": model_name}
 
 
 def main():
@@ -954,7 +973,21 @@ def main():
 
         for seed_idx in range(args.seeds):
             seed = args.seed + seed_idx
+            completed_specs = {}
             for spec in model_specs:
+                fingerprint = spec["fingerprint"]
+                if fingerprint in completed_specs:
+                    metric_rows, curve_rows, expert_rows, metadata = completed_specs[fingerprint]
+                    print(
+                        f"{spec['name']}: reusing identical run from {metadata['model']} seed={seed}",
+                        flush=True,
+                    )
+                    all_metric_rows.extend(clone_rows_for_model(metric_rows, spec["name"]))
+                    all_curve_rows.extend(clone_rows_for_model(curve_rows, spec["name"]))
+                    all_expert_rows.extend(clone_rows_for_model(expert_rows, spec["name"]))
+                    all_metadata_rows.append(clone_metadata_for_model(metadata, spec["name"]))
+                    continue
+
                 torch.manual_seed(seed)
                 model = spec["builder"]()
                 params = sum(p.numel() for p in model.parameters())
@@ -970,6 +1003,7 @@ def main():
                 all_curve_rows.extend(curve_rows)
                 all_expert_rows.extend(expert_rows)
                 all_metadata_rows.append(metadata)
+                completed_specs[fingerprint] = (metric_rows, curve_rows, expert_rows, metadata)
                 del model
                 if device_type == "mps":
                     torch.mps.empty_cache()
